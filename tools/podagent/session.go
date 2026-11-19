@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -18,62 +17,35 @@ var passthroughEnv = []string{
 	"OPENROUTER_API_KEY", "GEMINI_API_KEY", "GH_TOKEN", "GITHUB_TOKEN",
 }
 
-// Session is one agent container bound to a repo (or a worktree of it).
+// Session is one agent container bound to a repo.
 type Session struct {
 	Agent     Agent
 	Repo      string // main checkout on the host
-	Workspace string // directory mounted at /home/agent/workspace
-	Branch    string // set when Workspace is a worktree
+	GitDir    string // the host repo's .git (common dir)
+	Workspace string // host directory mounted at /home/agent/workspace
+	Branch    string // --branch; empty means the host checkout itself is shared
+	GitBranch string // branch the container's repo works on
 	Base      string
 	Container string
 }
 
-// gitGuardMounts mounts the repo's git hooks and config read-only over the
-// read-write .git. The agent runs without permission prompts, and a hook or
-// a config key like core.fsmonitor that it wrote there would run on the
-// host the next time anyone ran git in the repo.
-func gitGuardMounts(hostGitDir, containerGitDir string) ([]Mount, error) {
-	hooks := filepath.Join(hostGitDir, "hooks")
-	if err := os.MkdirAll(hooks, 0o755); err != nil {
-		return nil, err
-	}
-	return []Mount{
-		{Host: hooks, Container: filepath.Join(containerGitDir, "hooks"), ReadOnly: true},
-		{Host: filepath.Join(hostGitDir, "config"), Container: filepath.Join(containerGitDir, "config"), ReadOnly: true},
-	}, nil
-}
+// shared reports whether the host checkout itself is the workspace.
+func (s *Session) shared() bool { return s.Branch == "" }
 
-// hostGitSafety stops podagent's own host-side git calls from running hooks
-// or an fsmonitor command taken from the repo.
-var hostGitSafety = []string{"-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"}
-
-func gitOut(dir string, args ...string) (string, error) {
-	full := append(append([]string{"-C", dir}, hostGitSafety...), args...)
-	cmd := exec.Command("git", full...)
-	out, err := cmd.Output()
-	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return "", fmt.Errorf("git %s: %s", strings.Join(args, " "), strings.TrimSpace(string(ee.Stderr)))
-		}
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
-func repoRoot(dir string) (string, error) {
+func repoRoot(dir string) (root, gitDir string, err error) {
 	if dir == "" {
 		dir = "."
 	}
 	abs, err := filepath.Abs(dir)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	// --git-common-dir handles being called from inside a worktree.
 	common, err := gitOut(abs, "rev-parse", "--path-format=absolute", "--git-common-dir")
 	if err != nil {
-		return "", fmt.Errorf("%s is not inside a git repository", abs)
+		return "", "", fmt.Errorf("%s is not inside a git repository", abs)
 	}
-	return filepath.Dir(common), nil
+	return filepath.Dir(common), common, nil
 }
 
 var slugRe = regexp.MustCompile(`[^a-z0-9]+`)
@@ -97,44 +69,45 @@ func defaultBase(repo string) string {
 	return "HEAD"
 }
 
-// newSession resolves the repo and, when branch is set, creates or reuses a
-// git worktree at .sandcastle/worktrees/<branch> (already gitignored).
+// newSession resolves the repo. Without a branch the host checkout is the
+// workspace; with one, a separate directory .sandcastle/worktrees/<branch>.
 func newSession(a Agent, repoFlag, branch, base string) (*Session, error) {
-	repo, err := repoRoot(repoFlag)
+	repo, gitDir, err := repoRoot(repoFlag)
 	if err != nil {
 		return nil, err
 	}
-	s := &Session{Agent: a, Repo: repo, Workspace: repo, Branch: branch, Base: base,
-		Container: containerName(repo, a, branch)}
-	if branch == "" {
-		return s, nil
-	}
+	s := &Session{Agent: a, Repo: repo, GitDir: gitDir, Workspace: repo, Branch: branch,
+		GitBranch: branch, Base: base, Container: containerName(repo, a, branch)}
 	if s.Base == "" {
 		s.Base = defaultBase(repo)
 	}
-	s.Workspace = filepath.Join(repo, ".sandcastle", "worktrees", slug(branch))
+	if branch != "" {
+		s.Workspace = filepath.Join(repo, ".sandcastle", "worktrees", slug(branch))
+		return s, nil
+	}
+	// Empty on a detached HEAD; only creating a container needs it.
+	s.GitBranch, _ = gitOut(repo, "symbolic-ref", "--short", "-q", "HEAD")
 	return s, nil
 }
 
-func (s *Session) ensureWorktree() error {
-	if s.Branch == "" {
+// ensureWorkspaceDir creates the --branch directory. It is a plain folder:
+// the container's repo checks the branch out into it.
+func (s *Session) ensureWorkspaceDir() error {
+	if s.shared() {
 		return nil
 	}
-	if _, err := os.Stat(filepath.Join(s.Workspace, ".git")); err == nil {
-		return nil
+	if st, err := os.Lstat(filepath.Join(s.Workspace, ".git")); err == nil && !st.IsDir() {
+		return fmt.Errorf("%s is a git worktree from an older podagent; remove it with `git worktree remove %s` first", s.Workspace, s.Workspace)
 	}
-	if err := os.MkdirAll(filepath.Dir(s.Workspace), 0o755); err != nil {
+	parent := filepath.Dir(s.Workspace)
+	if err := os.MkdirAll(s.Workspace, 0o755); err != nil {
 		return err
 	}
-	var args []string
-	if _, err := gitOut(s.Repo, "rev-parse", "--verify", "--quiet", "refs/heads/"+s.Branch); err == nil {
-		args = []string{"worktree", "add", s.Workspace, s.Branch}
-	} else {
-		args = []string{"worktree", "add", "-b", s.Branch, s.Workspace, s.Base}
+	ignore := filepath.Join(parent, ".gitignore")
+	if _, err := os.Stat(ignore); os.IsNotExist(err) {
+		return os.WriteFile(ignore, []byte("*\n"), 0o644)
 	}
-	fmt.Fprintf(os.Stderr, "podagent: git %s\n", strings.Join(args, " "))
-	_, err := gitOut(s.Repo, args...)
-	return err
+	return nil
 }
 
 // readEnvFile parses KEY=VALUE lines; blank lines and # comments are skipped.
@@ -199,14 +172,12 @@ func (s *Session) ensureContainer(o startOpts) (bool, error) {
 		}
 	}
 	if containerExists(s.Container) {
-		if !containerRunning(s.Container) {
-			if err := podman("start", s.Container); err != nil {
-				return false, err
-			}
-		}
-		return false, nil
+		return false, s.attach()
 	}
-	if err := s.ensureWorktree(); err != nil {
+	if s.GitBranch == "" {
+		return false, fmt.Errorf("%s has a detached HEAD; check out a branch or pass --branch", s.Repo)
+	}
+	if err := s.ensureWorkspaceDir(); err != nil {
 		return false, err
 	}
 
@@ -237,32 +208,30 @@ func (s *Session) ensureContainer(o startOpts) (bool, error) {
 		}
 	}
 
-	mounts := []Mount{{Host: s.Workspace, Container: containerWorkspace}}
-	gitDir := filepath.Join(s.Repo, ".git")
-	containerGitDir := filepath.Join(containerWorkspace, ".git")
-	if s.Workspace != s.Repo {
-		// A worktree's .git file points at <repo>/.git/worktrees/<name> by
-		// absolute host path, so mount the main .git at that same path.
-		mounts = append(mounts, Mount{Host: gitDir, Container: gitDir})
-		containerGitDir = gitDir
+	// The workspace files are shared; git metadata is not (see gitsync.go).
+	mounts := []Mount{
+		{Host: s.Workspace, Container: containerWorkspace},
+		{Host: s.GitDir, Container: hostGitMount, ReadOnly: true},
 	}
-	guards, err := gitGuardMounts(gitDir, containerGitDir)
-	if err != nil {
-		return false, err
-	}
-	mounts = append(mounts, guards...)
 	spec := ContainerSpec{
 		Name: s.Container, Image: imageName(s.Agent), Env: env, Ports: o.Ports,
 		Labels: map[string]string{
 			"podagent.agent": s.Agent.Name, "podagent.repo": s.Repo,
-			"podagent.branch": s.Branch,
+			"podagent.branch": s.Branch, gitBranchLabel: s.GitBranch,
 		},
+		Volumes: []string{gitVolume(s.Container) + ":" + containerWorkspace + "/.git:U"},
 	}
 	spec.Mounts = mounts
 
 	fmt.Fprintf(os.Stderr, "podagent: starting container %s (%s mounted at %s)\n", s.Container, s.Workspace, containerWorkspace)
 	if err := createContainer(spec); err != nil {
 		return false, err
+	}
+	if err := s.initContainerRepo(); err != nil {
+		// Don't leave a half-seeded container around to be reused.
+		_ = podman("rm", "-f", "--time", "0", s.Container)
+		_ = podman("volume", "rm", "-f", gitVolume(s.Container))
+		return false, fmt.Errorf("seed container repo: %w", err)
 	}
 	if o.HostAuth {
 		if err := s.copyHostAuth(); err != nil {
@@ -278,23 +247,39 @@ func (s *Session) ensureContainer(o startOpts) (bool, error) {
 	return true, nil
 }
 
-// builtinArgs mirrors Sandcastle's SOURCE_BRANCH / TARGET_BRANCH.
-func (s *Session) builtinArgs() map[string]string {
-	out := map[string]string{}
-	if b, err := gitOut(s.Workspace, "rev-parse", "--abbrev-ref", "HEAD"); err == nil {
-		out["SOURCE_BRANCH"] = b
-		out["BRANCH"] = b
+const gitBranchLabel = "podagent.gitbranch"
+
+// attach starts an existing container and reads the branch its repo was
+// created on, which may differ from the host's current branch by now.
+func (s *Session) attach() error {
+	if !containerRunning(s.Container) {
+		if err := podman("start", s.Container); err != nil {
+			return err
+		}
 	}
-	target := s.Base
-	if target == "" {
-		target = defaultBase(s.Repo)
+	b, err := podmanOutput("inspect", "-f", `{{index .Config.Labels "`+gitBranchLabel+`"}}`, s.Container)
+	if err != nil {
+		return err
 	}
-	out["TARGET_BRANCH"] = strings.TrimPrefix(target, "origin/")
-	return out
+	if b == "" || b == "<no value>" {
+		return fmt.Errorf("container %s was made by an older podagent; `podman rm -f %s` and run again", s.Container, s.Container)
+	}
+	s.GitBranch = b
+	return nil
 }
 
+// builtinArgs mirrors Sandcastle's SOURCE_BRANCH / TARGET_BRANCH.
+func (s *Session) builtinArgs() map[string]string {
+	return map[string]string{
+		"SOURCE_BRANCH": s.GitBranch,
+		"BRANCH":        s.GitBranch,
+		"TARGET_BRANCH": strings.TrimPrefix(s.Base, "origin/"),
+	}
+}
+
+// head is the container repo's HEAD commit.
 func (s *Session) head() string {
-	h, _ := gitOut(s.Workspace, "rev-parse", "HEAD")
+	h, _ := containerShellOutput(s.Container, containerWorkspace, "git rev-parse HEAD")
 	return h
 }
 

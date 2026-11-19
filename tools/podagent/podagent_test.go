@@ -130,24 +130,38 @@ func TestReadEnvFile(t *testing.T) {
 	}
 }
 
-func TestGitGuardMountsAreReadOnly(t *testing.T) {
-	gitDir := filepath.Join(t.TempDir(), ".git")
-	os.MkdirAll(gitDir, 0o755)
-	mounts, err := gitGuardMounts(gitDir, "/home/agent/workspace/.git")
-	if err != nil {
-		t.Fatal(err)
+func TestPlanSync(t *testing.T) {
+	cases := []struct {
+		name         string
+		old, tip     string
+		ff           bool
+		checkedOutAt []string
+		shared       string
+		want         syncPlan
+	}{
+		{"unchanged", "a", "a", true, nil, "", syncNothing},
+		{"new branch", "", "b", true, nil, "", syncUpdate},
+		{"fast-forward, not checked out", "a", "b", true, nil, "", syncUpdate},
+		{"diverged", "a", "b", false, nil, "", syncKeepAside},
+		{"shared checkout", "a", "b", true, []string{"/repo"}, "/repo", syncUpdateAndReset},
+		{"checked out elsewhere", "a", "b", true, []string{"/other"}, "/repo", syncKeepAside},
+		{"checked out, not shared", "a", "b", true, []string{"/repo"}, "", syncKeepAside},
 	}
-	want := []string{
-		gitDir + "/hooks:/home/agent/workspace/.git/hooks:ro,z",
-		gitDir + "/config:/home/agent/workspace/.git/config:ro,z",
-	}
-	for i, m := range mounts {
-		if m.flag() != want[i] {
-			t.Errorf("mount %d = %q, want %q", i, m.flag(), want[i])
+	for _, c := range cases {
+		if got := planSync(c.old, c.tip, c.ff, c.checkedOutAt, c.shared); got != c.want {
+			t.Errorf("%s: got %d, want %d", c.name, got, c.want)
 		}
 	}
-	if st, err := os.Stat(filepath.Join(gitDir, "hooks")); err != nil || !st.IsDir() {
-		t.Error("hooks dir not created")
+}
+
+func TestShaRe(t *testing.T) {
+	for in, want := range map[string]bool{
+		strings.Repeat("a", 40): true, strings.Repeat("0", 64): true,
+		"HEAD": false, strings.Repeat("a", 40) + "; rm -rf /": false, "": false,
+	} {
+		if shaRe.MatchString(in) != want {
+			t.Errorf("%q: want %v", in, want)
+		}
 	}
 }
 

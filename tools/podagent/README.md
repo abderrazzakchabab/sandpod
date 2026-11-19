@@ -27,13 +27,20 @@ podagent run claude --prompt implement \
 
 podagent shell claude               # bash in /home/agent/workspace
 podagent code claude                # VS Code attached to the container
+podagent sync claude                # copy the container's commits to your repo
 podagent ls                         # list containers
-podagent rm claude                  # remove the container
+podagent rm claude                  # sync, then remove the container
 podagent prompts                    # prompt names this repo provides
 ```
 
 Commands that target a container take the same `--repo` / `--branch` flags as
 the `run` that created it.
+
+Without `--branch` the container works on your checkout's files and current
+branch. With `--branch fix-42` it works in a separate folder,
+`.sandcastle/worktrees/fix-42/`, on that branch (created from `--base`,
+default `origin/main`). Either way, commits reach your repo only through
+sync; see [Git and commits](#git-and-commits).
 
 ### Software factory
 
@@ -42,9 +49,10 @@ podagent factory claude --issue 42 --title "Fix x" --branch fix-42
 ```
 
 Same steps as `.factory/implement-task.ts`, on Podman instead of Docker:
-creates a worktree for the branch (from `--base`, default `origin/main`) in
-`.sandcastle/worktrees/`, runs `npm install && npm run build` once, runs the
-`implement` prompt, then the `review` prompt if the implementer committed.
+works on the branch in `.sandcastle/worktrees/<branch>/` (from `--base`,
+default `origin/main`), runs `npm install && npm run build` once, runs the
+`implement` prompt, then the `review` prompt if the implementer committed,
+and syncs the commits to the branch in your repo after each.
 With no flags it reads the daemon's `FACTORY_BRANCH`, `FACTORY_BASE`,
 `FACTORY_REPO_PATH`, `FACTORY_TASK_DESCRIPTION` and
 `FACTORY_TASK_ISSUE_NUMBER`, so the daemon can spawn `podagent factory claude`
@@ -92,16 +100,43 @@ Sandcastle. Commands that arrive through argument values are not run, and a
   --no-cache` picks up new agent releases.
 - `--userns=keep-id:uid=1000,gid=1000`: your host user is `agent` inside, so
   files the agent writes stay yours.
-- Repo mounts use the SELinux `:z` label. Worktree runs also mount the main
-  `.git` at its host path so git works inside.
-- `.git/hooks` and `.git/config` are mounted read-only, so the agent can't
-  plant a hook or a `core.fsmonitor` command that would run on your host the
-  next time you use git. podagent's own host git calls also disable hooks
-  and fsmonitor. Everything else in the repo, including the rest of `.git`,
-  stays writable to the agent.
+- Repo mounts use the SELinux `:z` label.
 - The agent runs with its permission prompts turned off
   (`--dangerously-skip-permissions` and similar). The container is the
-  sandbox, and the mounted repo is writable.
+  sandbox, and the workspace files are writable.
+
+## Git and commits
+
+The agent never gets write access to your repo's `.git`. Anything it wrote
+there (a hook, a `core.fsmonitor` setting, a `commondir` file) could make git
+on your host run its code. So:
+
+- The workspace **files** are shared live, so you see edits as they happen.
+- The container has its **own git repo**, in a podman volume mounted over
+  `workspace/.git`, seeded from your repo when the container is created.
+  Your `.git` is mounted read-only, only for that seeding.
+- **Sync** copies the container branch's commits back as a git bundle, which
+  is plain data, and fetches it with hooks and fsmonitor turned off. It runs
+  after `run` and after each `factory` step, before `rm`, and on
+  `podagent sync`.
+
+What sync does with the commits:
+
+- Your branch moves forward to the container's commit when it's a
+  fast-forward and the branch isn't checked out elsewhere.
+- Without `--branch`, your checked-out branch moves forward and your index is
+  refreshed (`git reset`, which keeps your files but drops anything you had
+  staged), since the files already match.
+- When your branch has diverged, or is checked out in another worktree, the
+  commits are kept at `refs/podagent/out/<branch>` for you to merge.
+
+`podagent rm` refuses to remove a container whose final sync fails, because
+the container holds the only copy of its commits; `--force` removes it
+anyway.
+
+The agent can still write any file in the workspace, including a nested
+`.git` folder in a subdirectory. Don't run git inside a subfolder the agent
+created until you've looked at it.
 
 ## VS Code
 

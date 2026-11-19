@@ -28,7 +28,8 @@ Usage:
   podagent code <agent> [flags]       open VS Code attached to the container
   podagent build <agent> [--no-cache] build the agent image
   podagent ls                         list podagent containers
-  podagent rm <agent> [flags]         remove the agent's container
+  podagent sync <agent> [flags]       copy the container's commits to the host repo
+  podagent rm <agent> [flags]         sync, then remove the container
   podagent prompts [--repo DIR]       list prompts found in the repo
 
 Agents: ` + "claude, codex, opencode, pi" + `
@@ -56,6 +57,8 @@ func main() {
 		err = cmdBuild(rest)
 	case "ls", "list":
 		err = cmdList()
+	case "sync":
+		err = cmdSync(rest)
 	case "rm", "remove":
 		err = cmdRemove(rest)
 	case "prompts":
@@ -104,7 +107,7 @@ type sessionFlags struct {
 
 func (f *sessionFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.repo, "repo", "", "repository to mount (default: git repo of the current dir)")
-	fs.StringVar(&f.branch, "branch", "", "work in a git worktree on this branch (.sandcastle/worktrees/<branch>)")
+	fs.StringVar(&f.branch, "branch", "", "work on this branch in a separate folder (.sandcastle/worktrees/<branch>)")
 	fs.StringVar(&f.base, "base", "", "base ref for a new --branch (default: origin/main, else HEAD)")
 	fs.BoolVar(&verbose, "v", false, "print podman commands")
 }
@@ -168,10 +171,15 @@ func cmdRun(args []string) error {
 	case *detach:
 		return nil
 	case *prompt != "":
-		return s.runPrompt(*prompt, pargs, *model, *interactive)
+		err = s.runPrompt(*prompt, pargs, *model, *interactive)
 	default:
-		return containerExec(s.Container, execOpts{TTY: true}, a.Interactive(*model, "")...)
+		err = containerExec(s.Container, execOpts{TTY: true}, a.Interactive(*model, "")...)
 	}
+	// Bring commits back even when the agent exits non-zero.
+	if serr := s.sync(); serr != nil {
+		fmt.Fprintln(os.Stderr, "podagent: sync:", serr)
+	}
+	return err
 }
 
 // cmdFactory is the Podman version of .factory/implement-task.ts: it reads
@@ -233,6 +241,9 @@ func cmdFactory(args []string) error {
 	if err := s.runPrompt(*implement, pargs, *model, false); err != nil {
 		return fmt.Errorf("implementer: %w", err)
 	}
+	if err := s.sync(); err != nil {
+		return err
+	}
 	if *review == "" {
 		return nil
 	}
@@ -243,7 +254,7 @@ func cmdFactory(args []string) error {
 	if err := s.runPrompt(*review, pargs, *model, false); err != nil {
 		return fmt.Errorf("reviewer: %w", err)
 	}
-	return nil
+	return s.sync()
 }
 
 func targetSession(name string, args []string) (*Session, error) {
@@ -264,10 +275,8 @@ func targetSession(name string, args []string) (*Session, error) {
 	if !containerExists(s.Container) {
 		return nil, fmt.Errorf("no container %s; start it with `podagent run %s -d`", s.Container, a.Name)
 	}
-	if !containerRunning(s.Container) {
-		if err := podman("start", s.Container); err != nil {
-			return nil, err
-		}
+	if err := s.attach(); err != nil {
+		return nil, err
 	}
 	return s, nil
 }
@@ -314,6 +323,7 @@ func cmdRemove(args []string) error {
 	fs := flag.NewFlagSet("rm", flag.ExitOnError)
 	var sf sessionFlags
 	sf.register(fs)
+	force := fs.Bool("force", false, "remove even if the final sync fails")
 	a, err := splitAgent(fs, args)
 	if err != nil {
 		return err
@@ -325,13 +335,31 @@ func cmdRemove(args []string) error {
 	if err := requirePodman(); err != nil {
 		return err
 	}
-	if err := podman("rm", "-f", "--time", "0", s.Container); err != nil {
-		return err
+	if containerExists(s.Container) {
+		if err := s.attach(); err != nil && !*force {
+			return fmt.Errorf("%w\nor pass --force to remove it anyway", err)
+		}
+		// The container's repo is the only copy of unsynced commits.
+		if err := s.sync(); err != nil && !*force {
+			return fmt.Errorf("%w\nnot removing; fix that or pass --force to discard the container's commits", err)
+		}
+		if err := podman("rm", "-f", "--time", "0", s.Container); err != nil {
+			return err
+		}
 	}
-	if s.Branch != "" {
-		fmt.Fprintf(os.Stderr, "podagent: worktree kept at %s (git worktree remove it when done)\n", s.Workspace)
+	_ = podmanIO(nil, "volume", "rm", "-f", gitVolume(s.Container))
+	if !s.shared() {
+		fmt.Fprintf(os.Stderr, "podagent: files kept at %s\n", s.Workspace)
 	}
 	return nil
+}
+
+func cmdSync(args []string) error {
+	s, err := targetSession("sync", args)
+	if err != nil {
+		return err
+	}
+	return s.sync()
 }
 
 func cmdPrompts(args []string) error {
@@ -340,7 +368,7 @@ func cmdPrompts(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	repo, err := repoRoot(*repoFlag)
+	repo, _, err := repoRoot(*repoFlag)
 	if err != nil {
 		return err
 	}

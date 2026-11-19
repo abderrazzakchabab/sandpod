@@ -125,6 +125,8 @@ type ContainerSpec struct {
 	Env    map[string]string
 	Labels map[string]string
 	Ports  []string
+	// Volumes are raw `-v` values for podman named volumes.
+	Volumes []string
 }
 
 // createContainer starts a detached container that sleeps forever. The host
@@ -154,6 +156,9 @@ func createContainer(s ContainerSpec) error {
 		// `-e KEY` (no value) reads from podman's own environment, which
 		// keeps secrets off the command line and out of `ps`.
 		args = append(args, "-e", k)
+	}
+	for _, v := range s.Volumes {
+		args = append(args, "-v", v)
 	}
 	for _, p := range s.Ports {
 		args = append(args, "-p", p)
@@ -199,7 +204,9 @@ func containerExec(name string, o execOpts, command ...string) error {
 	return podmanIO(o.Stdin, args...)
 }
 
-// containerShellOutput runs a bash command in the container and returns stdout.
-func containerShellOutput(name, dir, script string) (string, error) {
-	return podmanOutput("exec", "-w", dir, name, "bash", "-lc", script)
+// containerShellOutput runs a bash script in the container and returns
+// stdout. Extra args become $0, $1, ... so values are never spliced into the
+// script text.
+func containerShellOutput(name, dir, script string, args ...string) (string, error) {
+	return podmanOutput(append([]string{"exec", "-w", dir, name, "bash", "-lc", script}, args...)...)
 }

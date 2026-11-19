@@ -73,10 +73,14 @@ Sandcastle. Commands that arrive through argument values are not run, and a
   variables when set: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`,
   `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `GH_TOKEN`,
   `GITHUB_TOKEN`.
-- `--host-auth` bind-mounts the agent's login state from your home
-  (`~/.claude` + `~/.claude.json`, `~/.codex`, `~/.config/opencode` +
-  `~/.local/share/opencode`, `~/.pi`) read-write. The agent can then change
-  those files on your host.
+- `--host-auth` copies the agent's credential files from your home into the
+  container when it is created: `~/.claude/.credentials.json` and
+  `~/.claude.json`, `~/.codex/auth.json`,
+  `~/.local/share/opencode/auth.json`, or `~/.pi/agent/auth.json`. They are
+  copies, so the agent can't change your host's agent settings (a hook or an
+  MCP command written there would run the next time you used the agent on
+  your host). A token the agent refreshes stays in the container. If it
+  expires, `podagent rm` and run again.
 - Commits use your host `git config user.name` / `user.email`.
 - Env and mounts are fixed when the container is created. `podagent rm` and
   run again to change them.

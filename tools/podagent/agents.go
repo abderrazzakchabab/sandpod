@@ -15,8 +15,9 @@ type Agent struct {
 	// `USER agent`; otherwise it runs as the agent user.
 	Install     string
 	RootInstall bool
-	// HostAuth lists paths relative to $HOME that hold the agent's login
-	// state; --host-auth bind-mounts them into the container's home.
+	// HostAuth lists credential files, relative to $HOME, that --host-auth
+	// copies into the container's home. Only credentials: never settings or
+	// config, which can name commands the host CLI would later run.
 	HostAuth []string
 	// Print builds the non-interactive command. When it returns a non-empty
 	// stdin, the prompt is piped in instead of passed as an argument.
@@ -36,7 +37,7 @@ var agents = map[string]Agent{
 	"claude": {
 		Name:     "claude",
 		Install:  "RUN curl -fsSL https://claude.ai/install.sh | bash",
-		HostAuth: []string{".claude", ".claude.json"},
+		HostAuth: []string{".claude/.credentials.json", ".claude.json"},
 		Print: func(model, prompt string) ([]string, string) {
 			return withModel([]string{"claude", "--print", "--dangerously-skip-permissions"}, model), prompt
 		},
@@ -52,7 +53,7 @@ var agents = map[string]Agent{
 		Name:        "codex",
 		Install:     "RUN npm install -g @openai/codex",
 		RootInstall: true,
-		HostAuth:    []string{".codex"},
+		HostAuth:    []string{".codex/auth.json"},
 		Print: func(model, prompt string) ([]string, string) {
 			// `-` makes `codex exec` read the prompt from stdin.
 			return append(withModel([]string{"codex", "exec", "--dangerously-bypass-approvals-and-sandbox"}, model), "-"), prompt
@@ -69,7 +70,7 @@ var agents = map[string]Agent{
 		Name:        "opencode",
 		Install:     "RUN npm install -g opencode-ai@latest",
 		RootInstall: true,
-		HostAuth:    []string{".config/opencode", ".local/share/opencode"},
+		HostAuth:    []string{".local/share/opencode/auth.json"},
 		Print: func(model, prompt string) ([]string, string) {
 			return append(withModel([]string{"opencode", "run", "--dangerously-skip-permissions"}, model), prompt), ""
 		},
@@ -86,7 +87,7 @@ var agents = map[string]Agent{
 		Name:        "pi",
 		Install:     "RUN npm install -g @earendil-works/pi-coding-agent",
 		RootInstall: true,
-		HostAuth:    []string{".pi"},
+		HostAuth:    []string{".pi/agent/auth.json"},
 		Print: func(model, prompt string) ([]string, string) {
 			return withModel([]string{"pi", "-p"}, model), prompt
 		},

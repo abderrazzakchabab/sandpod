@@ -258,20 +258,16 @@ func (s *Session) ensureContainer(o startOpts) (bool, error) {
 			"podagent.branch": s.Branch,
 		},
 	}
-	if o.HostAuth {
-		home, _ := os.UserHomeDir()
-		for _, rel := range s.Agent.HostAuth {
-			p := filepath.Join(home, rel)
-			if _, err := os.Stat(p); err == nil {
-				mounts = append(mounts, Mount{Host: p, Container: filepath.Join(containerHome, rel), NoRelabel: true})
-			}
-		}
-	}
 	spec.Mounts = mounts
 
 	fmt.Fprintf(os.Stderr, "podagent: starting container %s (%s mounted at %s)\n", s.Container, s.Workspace, containerWorkspace)
 	if err := createContainer(spec); err != nil {
 		return false, err
+	}
+	if o.HostAuth {
+		if err := s.copyHostAuth(); err != nil {
+			return true, err
+		}
 	}
 	if o.Setup != "" {
 		fmt.Fprintf(os.Stderr, "podagent: setup: %s\n", o.Setup)
@@ -331,4 +327,33 @@ func (s *Session) runPrompt(promptName string, userArgs map[string]string, model
 		return containerExec(s.Container, execOpts{}, argv...)
 	}
 	return containerExec(s.Container, execOpts{Stdin: &stdin}, argv...)
+}
+
+// copyHostAuth copies the agent's credential files into the container. They
+// are copies, not mounts, so nothing the agent does reaches the host's
+// files. A token the agent refreshes inside stays inside.
+func (s *Session) copyHostAuth() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	for _, rel := range s.Agent.HostAuth {
+		src := filepath.Join(home, rel)
+		if st, err := os.Stat(src); err != nil || !st.Mode().IsRegular() {
+			continue
+		}
+		dst := filepath.Join(containerHome, rel)
+		if err := containerExec(s.Container, execOpts{}, "mkdir", "-p", filepath.Dir(dst)); err != nil {
+			return err
+		}
+		if err := podman("cp", src, s.Container+":"+dst); err != nil {
+			return fmt.Errorf("copy %s into container: %w", src, err)
+		}
+		owner := fmt.Sprintf("%d:%d", containerUID, containerGID)
+		if err := podman("exec", "-u", "0", s.Container, "chown", owner, dst); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "podagent: copied ~/%s into the container\n", rel)
+	}
+	return nil
 }

@@ -123,7 +123,7 @@ type startFlags struct {
 func (f *startFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.envFile, "env-file", "", "env file passed to the container (default: <repo>/.sandcastle/.env)")
 	fs.StringVar(&f.setup, "setup", "", "shell command run once when the container is created (e.g. \"npm install\")")
-	fs.BoolVar(&f.hostAuth, "host-auth", false, "bind-mount the agent's login state from your home (e.g. ~/.claude, ~/.codex)")
+	fs.BoolVar(&f.hostAuth, "host-auth", false, "copy the agent's credential file from your home into the container (e.g. ~/.codex/auth.json)")
 	fs.BoolVar(&f.rebuild, "rebuild", false, "rebuild the agent image first")
 	fs.Var(&f.ports, "p", "publish a port, podman syntax (repeatable), e.g. -p 3000:3000")
 }

@@ -28,8 +28,28 @@ type Session struct {
 	Container string
 }
 
+// gitGuardMounts mounts the repo's git hooks and config read-only over the
+// read-write .git. The agent runs without permission prompts, and a hook or
+// a config key like core.fsmonitor that it wrote there would run on the
+// host the next time anyone ran git in the repo.
+func gitGuardMounts(hostGitDir, containerGitDir string) ([]Mount, error) {
+	hooks := filepath.Join(hostGitDir, "hooks")
+	if err := os.MkdirAll(hooks, 0o755); err != nil {
+		return nil, err
+	}
+	return []Mount{
+		{Host: hooks, Container: filepath.Join(containerGitDir, "hooks"), ReadOnly: true},
+		{Host: filepath.Join(hostGitDir, "config"), Container: filepath.Join(containerGitDir, "config"), ReadOnly: true},
+	}, nil
+}
+
+// hostGitSafety stops podagent's own host-side git calls from running hooks
+// or an fsmonitor command taken from the repo.
+var hostGitSafety = []string{"-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"}
+
 func gitOut(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	full := append(append([]string{"-C", dir}, hostGitSafety...), args...)
+	cmd := exec.Command("git", full...)
 	out, err := cmd.Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
@@ -218,12 +238,19 @@ func (s *Session) ensureContainer(o startOpts) (bool, error) {
 	}
 
 	mounts := []Mount{{Host: s.Workspace, Container: containerWorkspace}}
+	gitDir := filepath.Join(s.Repo, ".git")
+	containerGitDir := filepath.Join(containerWorkspace, ".git")
 	if s.Workspace != s.Repo {
 		// A worktree's .git file points at <repo>/.git/worktrees/<name> by
 		// absolute host path, so mount the main .git at that same path.
-		gitDir := filepath.Join(s.Repo, ".git")
 		mounts = append(mounts, Mount{Host: gitDir, Container: gitDir})
+		containerGitDir = gitDir
 	}
+	guards, err := gitGuardMounts(gitDir, containerGitDir)
+	if err != nil {
+		return false, err
+	}
+	mounts = append(mounts, guards...)
 	spec := ContainerSpec{
 		Name: s.Container, Image: imageName(s.Agent), Env: env, Ports: o.Ports,
 		Labels: map[string]string{

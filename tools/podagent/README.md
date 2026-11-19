@@ -90,6 +90,11 @@ Sandcastle. Commands that arrive through argument values are not run, and a
   files the agent writes stay yours.
 - Repo mounts use the SELinux `:z` label. Worktree runs also mount the main
   `.git` at its host path so git works inside.
+- `.git/hooks` and `.git/config` are mounted read-only, so the agent can't
+  plant a hook or a `core.fsmonitor` command that would run on your host the
+  next time you use git. podagent's own host git calls also disable hooks
+  and fsmonitor. Everything else in the repo, including the rest of `.git`,
+  stays writable to the agent.
 - The agent runs with its permission prompts turned off
   (`--dangerously-skip-permissions` and similar). The container is the
   sandbox, and the mounted repo is writable.

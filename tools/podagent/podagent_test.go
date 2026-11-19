@@ -130,6 +130,27 @@ func TestReadEnvFile(t *testing.T) {
 	}
 }
 
+func TestGitGuardMountsAreReadOnly(t *testing.T) {
+	gitDir := filepath.Join(t.TempDir(), ".git")
+	os.MkdirAll(gitDir, 0o755)
+	mounts, err := gitGuardMounts(gitDir, "/home/agent/workspace/.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		gitDir + "/hooks:/home/agent/workspace/.git/hooks:ro,z",
+		gitDir + "/config:/home/agent/workspace/.git/config:ro,z",
+	}
+	for i, m := range mounts {
+		if m.flag() != want[i] {
+			t.Errorf("mount %d = %q, want %q", i, m.flag(), want[i])
+		}
+	}
+	if st, err := os.Stat(filepath.Join(gitDir, "hooks")); err != nil || !st.IsDir() {
+		t.Error("hooks dir not created")
+	}
+}
+
 func TestMountFlag(t *testing.T) {
 	if got := (Mount{Host: "/a", Container: "/b"}).flag(); got != "/a:/b:z" {
 		t.Error(got)
